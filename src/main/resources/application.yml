@@ -40,5 +40,5 @@ resilience4j:
   retry:
     instances:
       signalApi:
-        max-attempts: 3
-        wait-duration: 2s
+        max-attempts: 5
+        wait-duration: 10s
