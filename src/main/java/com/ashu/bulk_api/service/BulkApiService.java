@@ -16,6 +16,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientRequestException;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.netty.http.client.PrematureCloseException;
 import reactor.util.retry.Retry;
@@ -27,8 +28,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Semaphore;
-import java.util.stream.Collectors;
 
 @Service
 @Slf4j
@@ -40,9 +39,8 @@ public class BulkApiService {
     private final CircuitBreaker circuitBreaker;
 
     // ===== Concurrency Guard =====
-    // We use a semaphore to cap *concurrent* in-flight requests from this service instance.
-    // This is not an RPS limiter — it strictly controls concurrency (e.g., up to 1000 at a time).
-    private final Semaphore rateLimiter;
+    // Number of concurrent HTTP calls allowed per service instance (used by Reactor flatMap).
+    private final int maxConcurrentRequests;
 
     // ===== External API base URL (e.g., http://localhost:8081) =====
     @Value("${bulk-api.external-api.base-url}")
@@ -57,7 +55,7 @@ public class BulkApiService {
         this.webClient = webClient;
         this.statusRepository = statusRepository;
         this.circuitBreaker = circuitBreakerRegistry.circuitBreaker("signalApi");
-        this.rateLimiter = new Semaphore(maxConcurrentRequests);
+        this.maxConcurrentRequests = Math.max(1, maxConcurrentRequests);
     }
 
     /**
@@ -73,43 +71,23 @@ public class BulkApiService {
             return CompletableFuture.completedFuture(BatchResult.empty());
         }
 
-        log.info("🚀 Starting batch of {} messages on thread={} | availablePermits={}",
-                size, Thread.currentThread().getName(), rateLimiter.availablePermits());
+        log.info("🚀 Starting batch of {} messages on thread={} | concurrencyCap={} ",
+                size, Thread.currentThread().getName(), maxConcurrentRequests);
 
-        List<CompletableFuture<Boolean>> futures = messages.stream()
-                .map(this::postMessageReactiveToFuture)
-                .collect(Collectors.toList());
-
-        CompletableFuture<Void> joinHandle = CompletableFuture
-                .allOf(futures.toArray(new CompletableFuture[0]));
-
-        return joinHandle
-                .thenApply(v -> BatchResult.fromBooleans(
-                        futures.stream()
-                                .map(CompletableFuture::join)
-                                .collect(Collectors.toList())))
-                .whenComplete((result, ex) -> {
-                    if (ex != null) {
-                        log.error("❌ Batch completed with errors: {}", ex.getMessage(), ex);
-                    } else {
-                        log.info("✅ Batch completed: {} success / {} failure", result.successCount(), result.failureCount());
-                    }
-                });
-    }
-
-    /**
-     * Wraps the reactive pipeline of a single message POST into a CompletableFuture<Boolean>
-     * for orchestration compatibility. All success/failure side-effects (status persistence, logs)
-     * are handled inside the reactive pipeline.
-     */
-    private CompletableFuture<Boolean> postMessageReactiveToFuture(ApiMessage message) {
-        return postMessageReactive(message).toFuture();
+        return Flux.fromIterable(messages)
+                .flatMap(this::postMessageReactive, maxConcurrentRequests)
+                .collectList()
+                .map(BatchResult::fromBooleans)
+                .doOnError(ex -> log.error("❌ Batch completed with errors: {}", ex.getMessage(), ex))
+                .doOnSuccess(result -> log.info("✅ Batch completed: {} success / {} failure",
+                        result.successCount(), result.failureCount()))
+                .toFuture();
     }
 
     /**
      * Core reactive pipeline for posting a single message.
      * Key points:
-     *  - **Semaphore acquire/release** to cap concurrency.
+     *  - **Reactor flatMap handles concurrency upstream**, so this pipeline stays fully non-blocking.
      *  - **Timeout** to fail slow calls (mapped to error to trigger retry/breaker).
      *  - **Circuit Breaker** (Resilience4j) to short-circuit when downstream is unhealthy.
      *  - **Retry** (reactor.util.retry.Retry) on *retryable* exceptions only.
@@ -119,20 +97,6 @@ public class BulkApiService {
     private Mono<Boolean> postMessageReactive(ApiMessage message) {
         // Defensive nulls
         Objects.requireNonNull(message, "message must not be null");
-
-        // BLOCKING acquire (on calling thread). We do it before we subscribe to the WebClient Mono,
-        // because WebClient will run on reactor threads and we want concurrency bounded upfront.
-        try {
-            rateLimiter.acquire();
-            log.debug("🔒 Acquired permit for uabsEventId={} | nowAvailable={}",
-                    message.getUabsEventId(), rateLimiter.availablePermits());
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            // Treat as a failure; record FAIL and return a failed Mono.
-            log.error("⚠️ Interrupted while acquiring semaphore for uabsEventId={}", message.getUabsEventId());
-            persistFail(message, "INTERRUPTED_ACQUIRE");
-            return Mono.just(false);
-        }
 
         // Build the reactive call
         return webClient.post()
@@ -155,13 +119,7 @@ public class BulkApiService {
                 // On any terminal error (after retries and/or breaker open), persist FAIL once
                 .doOnError(ex -> handleException(message, ex))
                 // Swallow errors for orchestration purposes (status already persisted via handleException)
-                .onErrorReturn(false)
-                // Always release the permit at terminal signal (success or error)
-                .doFinally(sig -> {
-                    rateLimiter.release();
-                    log.debug("🔓 Released permit for uabsEventId={} | nowAvailable={}",
-                            message.getUabsEventId(), rateLimiter.availablePermits());
-                });
+                .onErrorReturn(false);
     }
 
     /**
