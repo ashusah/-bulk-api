@@ -4,10 +4,12 @@ package com.ashu.bulk_api.service;
 import com.ashu.bulk_api.jpa.StatusRecord;
 import com.ashu.bulk_api.jpa.StatusRepository;
 import com.ashu.bulk_api.model.ApiMessage;
+import com.google.common.util.concurrent.RateLimiter;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.github.resilience4j.reactor.circuitbreaker.operator.CircuitBreakerOperator;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.scheduling.annotation.Async;
@@ -26,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.concurrent.Semaphore;
 
 @Service
@@ -40,7 +43,8 @@ public class BulkApiService {
     // ===== Concurrency Guard =====
     // We use a semaphore to cap *concurrent* in-flight requests from this service instance.
     // This is not an RPS limiter — it strictly controls concurrency (e.g., up to 1000 at a time).
-    private final Semaphore rateLimiter;
+    //private final Semaphore rateLimiter;
+    private final RateLimiter rateLimiter;
 
     // ===== External API base URL (e.g., http://localhost:8081) =====
     @Value("${bulk-api.external-api.base-url}")
@@ -49,12 +53,14 @@ public class BulkApiService {
     public BulkApiService(
             WebClient webClient,
             StatusRepository statusRepository,
-            CircuitBreakerRegistry circuitBreakerRegistry
+            CircuitBreakerRegistry circuitBreakerRegistry,
+            @Qualifier("rateLimitedExecutor") Executor rateLimitedExecutor, RateLimiter rateLimiter
     ) {
         this.webClient = webClient;
         this.statusRepository = statusRepository;
         this.circuitBreaker = circuitBreakerRegistry.circuitBreaker("signalApi");
-        this.rateLimiter = new Semaphore(100); // limit to 1000 concurrent calls
+        this.rateLimiter = rateLimiter;
+        //this.rateLimiter = new Semaphore(100); // limit to 1000 concurrent calls
     }
 
     /**
@@ -66,8 +72,9 @@ public class BulkApiService {
     @Async("bulkApiTaskExecutor")
     public CompletableFuture<Void> processBatch(List<ApiMessage> messages) {
         int size = messages == null ? 0 : messages.size();
-        log.info("🚀 Starting batch of {} messages on thread={} | availablePermits={}",
-                size, Thread.currentThread().getName(), rateLimiter.availablePermits());
+
+       /* log.info("🚀 Starting batch of {} messages on thread={} | availablePermits={}",
+                size, Thread.currentThread().getName(), rateLimiter.availablePermits());*/
 
         // Build a list of futures (each per message) and then wait for all of them
         List<CompletableFuture<Void>> futures = messages.stream()
@@ -91,6 +98,8 @@ public class BulkApiService {
      * are handled inside the reactive pipeline.
      */
     private CompletableFuture<Void> postMessageReactiveToFuture(ApiMessage message) {
+        rateLimiter.acquire();
+
         return postMessageReactive(message)
                 .then()          // Convert Mono<Map<...>> to Mono<Void> after side-effects
                 .toFuture();     // Expose as CompletableFuture<Void>
@@ -112,17 +121,9 @@ public class BulkApiService {
 
         // BLOCKING acquire (on calling thread). We do it before we subscribe to the WebClient Mono,
         // because WebClient will run on reactor threads and we want concurrency bounded upfront.
-        try {
-            rateLimiter.acquire();
-            log.debug("🔒 Acquired permit for uabsEventId={} | nowAvailable={}",
-                    message.getUabsEventId(), rateLimiter.availablePermits());
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            // Treat as a failure; record FAIL and return a failed Mono.
-            log.error("⚠️ Interrupted while acquiring semaphore for uabsEventId={}", message.getUabsEventId());
-            persistFail(message, "INTERRUPTED_ACQUIRE");
-            return Mono.error(ie);
-        }
+        rateLimiter.acquire();
+            /*log.debug("🔒 Acquired permit for uabsEventId={} | nowAvailable={}",
+                    message.getUabsEventId(), rateLimiter.availablePermits());*/
 
         // Build the reactive call
         return webClient.post()
@@ -157,9 +158,9 @@ public class BulkApiService {
 
                 // Always release the permit at terminal signal (success or error)
                 .doFinally(sig -> {
-                    rateLimiter.release();
-                    log.debug("🔓 Released permit for uabsEventId={} | nowAvailable={}",
-                            message.getUabsEventId(), rateLimiter.availablePermits());
+                    //rateLimiter.release();
+                    /*log.debug("🔓 Released permit for uabsEventId={} | nowAvailable={}",
+                            message.getUabsEventId(), rateLimiter.availablePermits())*/;
                 })
                 // In case upstream returns null somehow, normalize to empty map (shouldn't happen with retrieve())
                 .switchIfEmpty(Mono.fromSupplier(Collections::emptyMap));
