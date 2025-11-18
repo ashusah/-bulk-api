@@ -1,8 +1,8 @@
-# Concurrency control options for `BulkApiService`
+# Concurrency control options for `ExternalSignalBatchSender`
 
 The service currently caps concurrent HTTP calls with a classic `Semaphore`, but there are two
 reactive alternatives that achieve the same goal without blocking the calling thread. The snippets
-below show how each approach would look inside `BulkApiService` and call out the trade-offs so you
+below show how each approach would look inside `ExternalSignalBatchSender` and call out the trade-offs so you
 can pick the right guardrail for your deployment.
 
 > The examples omit unrelated details (status persistence, retries, etc.) to focus on concurrency.
@@ -12,7 +12,7 @@ can pick the right guardrail for your deployment.
 ```java
 private final Semaphore rateLimiter = new Semaphore(maxConcurrentRequests);
 
-private Mono<Boolean> postMessageReactive(ApiMessage message) {
+private Mono<Boolean> postMessageReactive(Signal message) {
     try {
         rateLimiter.acquire(); // blocks task-executor thread until a permit is available
     } catch (InterruptedException ie) {
@@ -68,7 +68,7 @@ BulkheadConfig bulkheadConfig = BulkheadConfig.custom()
         .build();
 Bulkhead bulkhead = Bulkhead.of("signalApiBulkhead", bulkheadConfig);
 
-private Mono<Boolean> postMessageReactive(ApiMessage message) {
+private Mono<Boolean> postMessageReactive(Signal message) {
     return webClient.post()
             .uri(externalApiBaseUrl + "/create-signal")
             .bodyValue(message)

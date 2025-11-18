@@ -14,7 +14,7 @@ import java.util.concurrent.ThreadPoolExecutor; // <-- This is correct
 public class AsyncConfiguration {
 
     @Bean(name = "bulkApiTaskExecutor")
-    public TaskExecutor bulkApiTaskExecutor() {
+    public ThreadPoolTaskExecutor bulkApiTaskExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
         executor.setCorePoolSize(20);
         executor.setMaxPoolSize(50);
