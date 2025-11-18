@@ -1,6 +1,7 @@
 package com.ashu.bulk_api.service;
 
 
+import com.ashu.bulk_api.dto.BatchResult;
 import com.ashu.bulk_api.jpa.StatusRecord;
 import com.ashu.bulk_api.jpa.StatusRepository;
 import com.ashu.bulk_api.model.ApiMessage;
@@ -27,6 +28,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Semaphore;
+import java.util.stream.Collectors;
 
 @Service
 @Slf4j
@@ -49,12 +51,13 @@ public class BulkApiService {
     public BulkApiService(
             WebClient webClient,
             StatusRepository statusRepository,
-            CircuitBreakerRegistry circuitBreakerRegistry
+            CircuitBreakerRegistry circuitBreakerRegistry,
+            @Value("${bulk-api.processing.rate-limit:100}") int maxConcurrentRequests
     ) {
         this.webClient = webClient;
         this.statusRepository = statusRepository;
         this.circuitBreaker = circuitBreakerRegistry.circuitBreaker("signalApi");
-        this.rateLimiter = new Semaphore(100); // limit to 1000 concurrent calls
+        this.rateLimiter = new Semaphore(maxConcurrentRequests);
     }
 
     /**
@@ -64,36 +67,43 @@ public class BulkApiService {
      * - We do NOT persist status here; that happens inside each call pipeline (success/error).
      */
     @Async("bulkApiTaskExecutor")
-    public CompletableFuture<Void> processBatch(List<ApiMessage> messages) {
+    public CompletableFuture<BatchResult> processBatch(List<ApiMessage> messages) {
         int size = messages == null ? 0 : messages.size();
+        if (size == 0) {
+            return CompletableFuture.completedFuture(BatchResult.empty());
+        }
+
         log.info("🚀 Starting batch of {} messages on thread={} | availablePermits={}",
                 size, Thread.currentThread().getName(), rateLimiter.availablePermits());
 
-        // Build a list of futures (each per message) and then wait for all of them
-        List<CompletableFuture<Void>> futures = messages.stream()
-                .map(this::postMessageReactiveToFuture) // returns CompletableFuture<Void>
-                .toList();
+        List<CompletableFuture<Boolean>> futures = messages.stream()
+                .map(this::postMessageReactiveToFuture)
+                .collect(Collectors.toList());
 
-        return CompletableFuture
-                .allOf(futures.toArray(new CompletableFuture[0]))
-                .whenComplete((v, ex) -> {
+        CompletableFuture<Void> joinHandle = CompletableFuture
+                .allOf(futures.toArray(new CompletableFuture[0]));
+
+        return joinHandle
+                .thenApply(v -> BatchResult.fromBooleans(
+                        futures.stream()
+                                .map(CompletableFuture::join)
+                                .collect(Collectors.toList())))
+                .whenComplete((result, ex) -> {
                     if (ex != null) {
                         log.error("❌ Batch completed with errors: {}", ex.getMessage(), ex);
                     } else {
-                        log.info("✅ Batch completed: {} messages processed", size);
+                        log.info("✅ Batch completed: {} success / {} failure", result.successCount(), result.failureCount());
                     }
                 });
     }
 
     /**
-     * Wraps the reactive pipeline of a single message POST into a CompletableFuture<Void>
+     * Wraps the reactive pipeline of a single message POST into a CompletableFuture<Boolean>
      * for orchestration compatibility. All success/failure side-effects (status persistence, logs)
      * are handled inside the reactive pipeline.
      */
-    private CompletableFuture<Void> postMessageReactiveToFuture(ApiMessage message) {
-        return postMessageReactive(message)
-                .then()          // Convert Mono<Map<...>> to Mono<Void> after side-effects
-                .toFuture();     // Expose as CompletableFuture<Void>
+    private CompletableFuture<Boolean> postMessageReactiveToFuture(ApiMessage message) {
+        return postMessageReactive(message).toFuture();
     }
 
     /**
@@ -106,7 +116,7 @@ public class BulkApiService {
      *  - **Single-source persistence**: PASS on success (ceh_event_id present), FAIL on error/fallback.
      *  - No duplication between onError and fallback handlers; exactly-once status write per message.
      */
-    private Mono<Map<String, Object>> postMessageReactive(ApiMessage message) {
+    private Mono<Boolean> postMessageReactive(ApiMessage message) {
         // Defensive nulls
         Objects.requireNonNull(message, "message must not be null");
 
@@ -121,7 +131,7 @@ public class BulkApiService {
             // Treat as a failure; record FAIL and return a failed Mono.
             log.error("⚠️ Interrupted while acquiring semaphore for uabsEventId={}", message.getUabsEventId());
             persistFail(message, "INTERRUPTED_ACQUIRE");
-            return Mono.error(ie);
+            return Mono.just(false);
         }
 
         // Build the reactive call
@@ -137,32 +147,21 @@ public class BulkApiService {
                 .transformDeferred(CircuitBreakerOperator.of(circuitBreaker))
                 // Retry ONLY on specific, transient failures
                 .retryWhen(buildRetrySpec())
+                .defaultIfEmpty(Collections.emptyMap())
                 // On success: validate ceh_event_id and persist PASS/FAIL accordingly
-                .doOnSuccess(response -> {
-                    Object ceh = response == null ? null : response.get("ceh_event_id");
-                    if (ceh != null) {
-                        long cehId = parseLongSafely(ceh);
-                        persistPass(message, cehId);
-                        log.info("✅ Posted uabsEventId={} | ceh_event_id={} | thread={}",
-                                message.getUabsEventId(), cehId, Thread.currentThread().getName());
-                    } else {
-                        // Consider missing ceh_event_id as a logical failure (no retry here; we've already retried)
-                        persistFail(message, "NO_CEH_EVENT_ID");
-                        log.warn("⚠️ No ceh_event_id returned for uabsEventId={} | thread={}",
-                                message.getUabsEventId(), Thread.currentThread().getName());
-                    }
-                })
+                .doOnSuccess(response -> handleSuccess(message, response))
+                // Convert payload into a boolean outcome so orchestrator can aggregate results
+                .map(response -> response != null && response.get("ceh_event_id") != null)
                 // On any terminal error (after retries and/or breaker open), persist FAIL once
                 .doOnError(ex -> handleException(message, ex))
-
+                // Swallow errors for orchestration purposes (status already persisted via handleException)
+                .onErrorReturn(false)
                 // Always release the permit at terminal signal (success or error)
                 .doFinally(sig -> {
                     rateLimiter.release();
                     log.debug("🔓 Released permit for uabsEventId={} | nowAvailable={}",
                             message.getUabsEventId(), rateLimiter.availablePermits());
-                })
-                // In case upstream returns null somehow, normalize to empty map (shouldn't happen with retrieve())
-                .switchIfEmpty(Mono.fromSupplier(Collections::emptyMap));
+                });
     }
 
     /**
@@ -215,18 +214,33 @@ public class BulkApiService {
     /** Persist PASS with ceh_event_id. */
     private void persistPass(ApiMessage message, long cehEventId) {
         Long uabsEventId = message.getUabsEventId();
-        StatusRecord rec = new StatusRecord(uabsEventId, cehEventId, "PASS");
+        StatusRecord rec = new StatusRecord(uabsEventId, cehEventId, "PASS", null);
         statusRepository.save(rec);
         log.debug("💾 Saved PASS status for uabsEventId={} ceh_event_id={}", uabsEventId, cehEventId);
     }
 
-    /** Persist FAIL (ceh_event_id is null). Reason is logged in status table 'status' field. */
+    /** Persist FAIL (ceh_event_id is null). Reason is captured for future diagnostics. */
     private void persistFail(ApiMessage message, String reason) {
         Long uabsEventId = message.getUabsEventId();
-        StatusRecord rec = new StatusRecord(uabsEventId, null, "FAIL");
-        // Optional: if you want to store reason, add a column or audit table. For now we just log.
+        String sanitizedReason = (reason == null || reason.isBlank()) ? "UNKNOWN" : reason;
+        StatusRecord rec = new StatusRecord(uabsEventId, null, "FAIL", sanitizedReason);
         statusRepository.save(rec);
-        log.debug("💾 Saved FAIL status for uabsEventId={} reason={}", uabsEventId, reason);
+        log.debug("💾 Saved FAIL status for uabsEventId={} reason={}", uabsEventId, sanitizedReason);
+    }
+
+    private void handleSuccess(ApiMessage message, Map<String, Object> response) {
+        Object ceh = response == null ? null : response.get("ceh_event_id");
+        if (ceh != null) {
+            long cehId = parseLongSafely(ceh);
+            persistPass(message, cehId);
+            log.info("✅ Posted uabsEventId={} | ceh_event_id={} | thread={}",
+                    message.getUabsEventId(), cehId, Thread.currentThread().getName());
+        } else {
+            // Consider missing ceh_event_id as a logical failure (no retry here; we've already retried)
+            persistFail(message, "NO_CEH_EVENT_ID");
+            log.warn("⚠️ No ceh_event_id returned for uabsEventId={} | thread={}",
+                    message.getUabsEventId(), Thread.currentThread().getName());
+        }
     }
 
     private void handleException(ApiMessage message, Throwable ex) {
@@ -266,45 +280,4 @@ public class BulkApiService {
         return Long.parseLong(String.valueOf(value));
     }
 
-    /** Persist UNKNOWN (request sent but response not confirmed). */
-    private void persistUnknown(ApiMessage message, String reason) {
-        Long uabsEventId = message.getUabsEventId();
-        StatusRecord rec = new StatusRecord(uabsEventId, null, "UNKNOWN");
-        statusRepository.save(rec);
-        log.debug("💾 Saved UNKNOWN status for uabsEventId={} reason={}", uabsEventId, reason);
-    }
-
-
-    /**
-     * Synchronous helper (rarely used in bulk flows).
-     * - Blocks the calling thread until response arrives.
-     * - No explicit retries/circuit breaker here to keep it simple; use reactive path for resilience.
-     * - Writes status PASS/FAIL exactly once.
-     */
-    public boolean postMessageSync(ApiMessage message) {
-        try {
-            Map<String, Object> response = webClient.post()
-                    .uri(externalApiBaseUrl + "/create-signal")
-                    .bodyValue(message)
-                    .retrieve()
-                    .bodyToMono(new ParameterizedTypeReference<Map<String, Object>>() {})
-                    .block(Duration.ofSeconds(10)); // hard block with timeout
-
-            Object ceh = response == null ? null : response.get("ceh_event_id");
-            if (ceh != null) {
-                long cehId = parseLongSafely(ceh);
-                persistPass(message, cehId);
-                log.info("✅ [SYNC] Posted uabsEventId={} | ceh_event_id={}", message.getUabsEventId(), cehId);
-                return true;
-            } else {
-                persistFail(message, "NO_CEH_EVENT_ID_SYNC");
-                log.warn("⚠️ [SYNC] No ceh_event_id returned for uabsEventId={}", message.getUabsEventId());
-                return false;
-            }
-        } catch (Exception e) {
-            persistFail(message, e.getClass().getSimpleName());
-            log.error("❌ [SYNC] Failed to post uabsEventId={} | error={}", message.getUabsEventId(), e.toString(), e);
-            return false;
-        }
-    }
 }

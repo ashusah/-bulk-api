@@ -1,6 +1,9 @@
 package com.ashu.bulk_api.jpa;
 
-import jakarta.persistence.*;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
@@ -19,6 +22,9 @@ public class StatusRecord {
     @Column(name = "ceh_event_id")
     private Long cehEventId;
 
-    @Column(name = "status", nullable = false, length = 10)
+    @Column(name = "status", nullable = false, length = 32)
     private String status;
+
+    @Column(name = "status_reason", length = 128)
+    private String statusReason;
 }
