@@ -1,4 +1,4 @@
-package com.ashu.bulk_api.jpa;
+package com.ashu.bulk_api.adapters.outbound.jpa;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;

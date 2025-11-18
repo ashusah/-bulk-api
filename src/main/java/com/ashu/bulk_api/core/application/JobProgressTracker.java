@@ -1,6 +1,6 @@
-package com.ashu.bulk_api.orchestrator;
+package com.ashu.bulk_api.core.application;
 
-import com.ashu.bulk_api.dto.BatchResult;
+import com.ashu.bulk_api.core.domain.job.BatchResult;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
