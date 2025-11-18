@@ -24,7 +24,4 @@ public class StatusRecord {
 
     @Column(name = "status", nullable = false, length = 32)
     private String status;
-
-    @Column(name = "status_reason", length = 128)
-    private String statusReason;
 }
