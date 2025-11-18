@@ -174,18 +174,18 @@ public class ExternalSignalBatchSender implements SignalBatchPort {
     /** Persist PASS with ceh_event_id. */
     private void persistPass(Signal message, long cehEventId) {
         Long uabsEventId = message.getUabsEventId();
-        StatusRecord rec = new StatusRecord(uabsEventId, cehEventId, "PASS");
+        StatusRecord rec = new StatusRecord(uabsEventId, cehEventId, "PASS", null);
         statusRepository.save(rec);
         log.debug("💾 Saved PASS status for uabsEventId={} ceh_event_id={}", uabsEventId, cehEventId);
     }
 
-    /** Persist FAIL (ceh_event_id is null). Reason captured inside the status value for diagnostics. */
+    /** Persist FAIL (ceh_event_id is null). Reason is captured for future diagnostics. */
     private void persistFail(Signal message, String reason) {
         Long uabsEventId = message.getUabsEventId();
-        String sanitizedReason = (reason == null || reason.isBlank()) ? "FAIL" : reason;
-        StatusRecord rec = new StatusRecord(uabsEventId, null, sanitizedReason);
+        String sanitizedReason = (reason == null || reason.isBlank()) ? "UNKNOWN" : reason;
+        StatusRecord rec = new StatusRecord(uabsEventId, null, "FAIL", sanitizedReason);
         statusRepository.save(rec);
-        log.debug("💾 Saved FAIL status for uabsEventId={} statusValue={}", uabsEventId, sanitizedReason);
+        log.debug("💾 Saved FAIL status for uabsEventId={} reason={}", uabsEventId, sanitizedReason);
     }
 
     private void handleSuccess(Signal message, Map<String, Object> response) {

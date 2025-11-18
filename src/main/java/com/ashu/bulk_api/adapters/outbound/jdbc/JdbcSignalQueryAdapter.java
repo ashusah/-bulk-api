@@ -4,6 +4,7 @@ import com.ashu.bulk_api.core.domain.model.Signal;
 import com.ashu.bulk_api.core.port.outbound.SignalQueryPort;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowCallbackHandler;
+
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Component;
 
