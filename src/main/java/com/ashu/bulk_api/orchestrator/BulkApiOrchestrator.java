@@ -3,6 +3,7 @@ package com.ashu.bulk_api.orchestrator;
 import com.ashu.bulk_api.dto.BatchResult;
 import com.ashu.bulk_api.dto.JobResult;
 import com.ashu.bulk_api.model.ApiMessage;
+import com.ashu.bulk_api.orchestrator.JobProgressTracker.JobProgress;
 import com.ashu.bulk_api.service.BulkApiService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -30,15 +31,18 @@ public class BulkApiOrchestrator {
 
     private final ThreadPoolTaskExecutor taskExecutor;
     private final int batchSize;
+    private final JobProgressTracker jobProgressTracker;
 
     public BulkApiOrchestrator(BulkApiService bulkApiService,
                                JdbcTemplate jdbcTemplate,
                                @Qualifier("bulkApiTaskExecutor") ThreadPoolTaskExecutor taskExecutor,
-                               @Value("${bulk-api.processing.batch-size:100}") int batchSize) {
+                               @Value("${bulk-api.processing.batch-size:100}") int batchSize,
+                               JobProgressTracker jobProgressTracker) {
         this.bulkApiService = bulkApiService;
         this.jdbcTemplate = jdbcTemplate;
         this.taskExecutor = taskExecutor;
         this.batchSize = Math.max(1, batchSize);
+        this.jobProgressTracker = jobProgressTracker;
     }
 
     public JobResult processAllMessages(List<ApiMessage> messages) {
@@ -50,43 +54,52 @@ public class BulkApiOrchestrator {
         log.info("🚀 Starting bulk processing for {} messages", messages.size());
         logExecutorStats("Before submitting tasks");
 
-        List<CompletableFuture<BatchResult>> batchFutures = new ArrayList<>();
+        List<TrackedBatch> trackedBatches = new ArrayList<>();
+        AtomicInteger batchCounter = new AtomicInteger();
         for (int start = 0; start < messages.size(); start += batchSize) {
             int end = Math.min(start + batchSize, messages.size());
             List<ApiMessage> batch = new ArrayList<>(messages.subList(start, end));
-            batchFutures.add(submitBatch(batch));
+            trackedBatches.add(submitBatch(batch, batchCounter.incrementAndGet()));
         }
 
-        JobResult result = awaitJobCompletion(batchFutures, "Synchronous request completed");
+        JobResult result = awaitJobCompletion(trackedBatches, "Synchronous request completed");
         log.info("✅ Synchronous processing finished. success={} failure={}",
                 result.getSuccessCount(), result.getFailureCount());
         return result;
     }
 
     public JobResult processAllMessagesFromDb() {
+        return processAllMessagesFromDb(null);
+    }
+
+    public JobResult processAllMessagesFromDb(String jobId) {
         log.info("Querying database for all signals...");
         logExecutorStats("Before submitting tasks");
-        List<CompletableFuture<BatchResult>> batchFutures = new ArrayList<>();
+        List<TrackedBatch> trackedBatches = new ArrayList<>();
         List<ApiMessage> buffer = new ArrayList<>(batchSize);
         AtomicInteger totalRows = new AtomicInteger();
+        AtomicInteger batchCounter = new AtomicInteger();
 
         jdbcTemplate.query(SIGNAL_SELECT, rs -> {
             buffer.add(mapRow(rs));
             totalRows.incrementAndGet();
             if (buffer.size() == batchSize) {
-                batchFutures.add(submitBatch(new ArrayList<>(buffer)));
+                trackedBatches.add(submitBatch(new ArrayList<>(buffer), batchCounter.incrementAndGet()));
                 buffer.clear();
             }
         });
 
         if (!buffer.isEmpty()) {
-            batchFutures.add(submitBatch(new ArrayList<>(buffer)));
+            trackedBatches.add(submitBatch(new ArrayList<>(buffer), batchCounter.incrementAndGet()));
         }
 
         log.info("Fetched {} messages from DB", totalRows.get());
 
+        JobProgress jobProgress = jobProgressTracker.start(jobId, trackedBatches.size());
+        attachProgressLogging(jobProgress, trackedBatches);
+
         String message = totalRows.get() == 0 ? "No signals found in DB" : "DB job completed";
-        JobResult result = awaitJobCompletion(batchFutures, message);
+        JobResult result = awaitJobCompletion(trackedBatches, message);
         log.info("✅ DB processing finished. success={} failure={}",
                 result.getSuccessCount(), result.getFailureCount());
         return result;
@@ -101,20 +114,34 @@ public class BulkApiOrchestrator {
         );
     }
 
-    private CompletableFuture<BatchResult> submitBatch(List<ApiMessage> batch) {
-        logExecutorStats("Submitting batch of size " + batch.size());
-        return bulkApiService.processBatch(batch);
+    private TrackedBatch submitBatch(List<ApiMessage> batch, int batchNumber) {
+        logExecutorStats("Submitting batch #" + batchNumber + " of size " + batch.size());
+        CompletableFuture<BatchResult> future = bulkApiService.processBatch(batch);
+        return new TrackedBatch(future, batchNumber, batch.size());
     }
 
-    private JobResult awaitJobCompletion(List<CompletableFuture<BatchResult>> batchFutures, String message) {
-        if (batchFutures.isEmpty()) {
+    private void attachProgressLogging(JobProgress jobProgress, List<TrackedBatch> trackedBatches) {
+        if (trackedBatches.isEmpty()) {
+            return;
+        }
+        trackedBatches.forEach(batch ->
+                batch.future().thenAccept(result ->
+                        jobProgressTracker.onBatchCompletion(jobProgress, batch.number(), batch.size(), result)));
+    }
+
+    private JobResult awaitJobCompletion(List<TrackedBatch> trackedBatches, String message) {
+        if (trackedBatches.isEmpty()) {
             return new JobResult(0, 0, message);
         }
 
-        CompletableFuture<Void> all = CompletableFuture.allOf(batchFutures.toArray(new CompletableFuture[0]));
+        List<CompletableFuture<BatchResult>> futures = trackedBatches.stream()
+                .map(TrackedBatch::future)
+                .collect(Collectors.toList());
+
+        CompletableFuture<Void> all = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
         all.join();
 
-        List<BatchResult> results = batchFutures.stream()
+        List<BatchResult> results = futures.stream()
                 .map(CompletableFuture::join)
                 .collect(Collectors.toList());
 
@@ -144,5 +171,7 @@ public class BulkApiOrchestrator {
                 rs.getDate("signal_end_date").toLocalDate()
         );
     }
+
+    private record TrackedBatch(CompletableFuture<BatchResult> future, int number, int size) {}
 }
 
