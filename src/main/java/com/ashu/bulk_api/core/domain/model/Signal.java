@@ -1,4 +1,4 @@
-package com.ashu.bulk_api.model;
+package com.ashu.bulk_api.core.domain.model;
 
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -10,7 +10,7 @@ import java.time.LocalDateTime;
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
-public class ApiMessage {
+public class Signal {
     private long uabsEventId;
     private String eventType;
     private String eventStatus;

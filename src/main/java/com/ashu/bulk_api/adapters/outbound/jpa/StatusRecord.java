@@ -1,4 +1,4 @@
-package com.ashu.bulk_api.jpa;
+package com.ashu.bulk_api.adapters.outbound.jpa;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
@@ -24,7 +24,4 @@ public class StatusRecord {
 
     @Column(name = "status", nullable = false, length = 32)
     private String status;
-
-    @Column(name = "status_reason", length = 128)
-    private String statusReason;
 }
