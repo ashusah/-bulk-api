@@ -1,4 +1,4 @@
-package com.ashu.bulk_api.dto;
+package com.ashu.bulk_api.core.domain.job;
 
 /**
  * Lightweight summary of a batch submission. Keeps track of how many messages

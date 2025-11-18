@@ -1,4 +1,4 @@
-package com.ashu.bulk_api.dto;
+package com.ashu.bulk_api.core.domain.job;
 
 /**
  * Lightweight response payload for asynchronous DB jobs so clients get a

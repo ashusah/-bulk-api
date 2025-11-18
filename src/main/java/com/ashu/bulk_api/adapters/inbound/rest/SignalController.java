@@ -1,9 +1,9 @@
-package com.ashu.bulk_api.controller;
+package com.ashu.bulk_api.adapters.inbound.rest;
 
-import com.ashu.bulk_api.dto.AsyncJobResponse;
-import com.ashu.bulk_api.dto.JobResult;
-import com.ashu.bulk_api.model.ApiMessage;
-import com.ashu.bulk_api.orchestrator.BulkApiOrchestrator;
+import com.ashu.bulk_api.core.domain.job.AsyncJobResponse;
+import com.ashu.bulk_api.core.domain.job.JobResult;
+import com.ashu.bulk_api.core.domain.model.Signal;
+import com.ashu.bulk_api.core.port.inbound.SignalProcessingUseCase;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.ResponseEntity;
@@ -17,20 +17,20 @@ import java.util.concurrent.CompletableFuture;
 @RestController
 @RequestMapping("/api/bulk")
 @Slf4j
-public class BulkApiController {
+public class SignalController {
 
-    private final BulkApiOrchestrator orchestrator;
+    private final SignalProcessingUseCase signalProcessingUseCase;
     private final ThreadPoolTaskExecutor taskExecutor;
 
-    public BulkApiController(BulkApiOrchestrator orchestrator,
-                             @Qualifier("bulkApiTaskExecutor") ThreadPoolTaskExecutor taskExecutor) {
-        this.orchestrator = orchestrator;
+    public SignalController(SignalProcessingUseCase signalProcessingUseCase,
+                            @Qualifier("bulkApiTaskExecutor") ThreadPoolTaskExecutor taskExecutor) {
+        this.signalProcessingUseCase = signalProcessingUseCase;
         this.taskExecutor = taskExecutor;
     }
 
     @PostMapping("/process-db")
     public ResponseEntity<JobResult> processBulkFromDb() {
-        JobResult result = orchestrator.processAllMessagesFromDb();
+        JobResult result = signalProcessingUseCase.processSignalsFromDatabase();
         return ResponseEntity.ok(result);
     }
 
@@ -39,7 +39,7 @@ public class BulkApiController {
         String jobId = UUID.randomUUID().toString();
 
         CompletableFuture<JobResult> jobFuture = CompletableFuture
-                .supplyAsync(() -> orchestrator.processAllMessagesFromDb(jobId), taskExecutor);
+                .supplyAsync(() -> signalProcessingUseCase.processSignalsFromDatabase(jobId), taskExecutor);
 
         jobFuture.whenComplete((result, ex) -> {
             if (ex != null) {
@@ -54,9 +54,16 @@ public class BulkApiController {
     }
 
     @PostMapping("/process-sync")
-    public ResponseEntity<JobResult> processSync(@RequestBody List<ApiMessage> messages) {
-        JobResult result = orchestrator.processAllMessages(messages); // Same orchestrator
+    public ResponseEntity<JobResult> processSync(@RequestBody List<Signal> messages) {
+        JobResult result = signalProcessingUseCase.processSignals(messages);
         return ResponseEntity.ok(result);
+    }
+
+    @GetMapping("/signals/{agreementId}")
+    public ResponseEntity<Signal> findLatestSignal(@PathVariable("agreementId") long agreementId) {
+        return signalProcessingUseCase.findLatestSignalByAgreementId(agreementId)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
     }
 
 }

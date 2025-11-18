@@ -1,10 +1,11 @@
-package com.ashu.bulk_api.service;
+package com.ashu.bulk_api.adapters.outbound.web;
 
 
-import com.ashu.bulk_api.dto.BatchResult;
-import com.ashu.bulk_api.jpa.StatusRecord;
-import com.ashu.bulk_api.jpa.StatusRepository;
-import com.ashu.bulk_api.model.ApiMessage;
+import com.ashu.bulk_api.adapters.outbound.jpa.StatusRecord;
+import com.ashu.bulk_api.adapters.outbound.jpa.StatusRepository;
+import com.ashu.bulk_api.core.domain.job.BatchResult;
+import com.ashu.bulk_api.core.domain.model.Signal;
+import com.ashu.bulk_api.core.port.outbound.SignalBatchPort;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.github.resilience4j.reactor.circuitbreaker.operator.CircuitBreakerOperator;
@@ -12,7 +13,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.scheduling.annotation.Async;
-import org.springframework.stereotype.Service;
+import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientRequestException;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
@@ -29,9 +30,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 
-@Service
+@Component
 @Slf4j
-public class BulkApiService {
+public class ExternalSignalBatchSender implements SignalBatchPort {
 
     // ===== Dependencies =====
     private final WebClient webClient;
@@ -46,7 +47,7 @@ public class BulkApiService {
     @Value("${bulk-api.external-api.base-url}")
     private String externalApiBaseUrl;
 
-    public BulkApiService(
+    public ExternalSignalBatchSender(
             WebClient webClient,
             StatusRepository statusRepository,
             CircuitBreakerRegistry circuitBreakerRegistry,
@@ -64,8 +65,9 @@ public class BulkApiService {
      * - Internally each message call is fully reactive (Mono), with retry + circuit breaker.
      * - We do NOT persist status here; that happens inside each call pipeline (success/error).
      */
+    @Override
     @Async("bulkApiTaskExecutor")
-    public CompletableFuture<BatchResult> processBatch(List<ApiMessage> messages) {
+    public CompletableFuture<BatchResult> submitBatch(List<Signal> messages) {
         int size = messages == null ? 0 : messages.size();
         if (size == 0) {
             return CompletableFuture.completedFuture(BatchResult.empty());
@@ -94,7 +96,7 @@ public class BulkApiService {
      *  - **Single-source persistence**: PASS on success (ceh_event_id present), FAIL on error/fallback.
      *  - No duplication between onError and fallback handlers; exactly-once status write per message.
      */
-    private Mono<Boolean> postMessageReactive(ApiMessage message) {
+    private Mono<Boolean> postMessageReactive(Signal message) {
         // Defensive nulls
         Objects.requireNonNull(message, "message must not be null");
 
@@ -170,7 +172,7 @@ public class BulkApiService {
     }
 
     /** Persist PASS with ceh_event_id. */
-    private void persistPass(ApiMessage message, long cehEventId) {
+    private void persistPass(Signal message, long cehEventId) {
         Long uabsEventId = message.getUabsEventId();
         StatusRecord rec = new StatusRecord(uabsEventId, cehEventId, "PASS", null);
         statusRepository.save(rec);
@@ -178,7 +180,7 @@ public class BulkApiService {
     }
 
     /** Persist FAIL (ceh_event_id is null). Reason is captured for future diagnostics. */
-    private void persistFail(ApiMessage message, String reason) {
+    private void persistFail(Signal message, String reason) {
         Long uabsEventId = message.getUabsEventId();
         String sanitizedReason = (reason == null || reason.isBlank()) ? "UNKNOWN" : reason;
         StatusRecord rec = new StatusRecord(uabsEventId, null, "FAIL", sanitizedReason);
@@ -186,7 +188,7 @@ public class BulkApiService {
         log.debug("💾 Saved FAIL status for uabsEventId={} reason={}", uabsEventId, sanitizedReason);
     }
 
-    private void handleSuccess(ApiMessage message, Map<String, Object> response) {
+    private void handleSuccess(Signal message, Map<String, Object> response) {
         Object ceh = response == null ? null : response.get("ceh_event_id");
         if (ceh != null) {
             long cehId = parseLongSafely(ceh);
@@ -201,7 +203,7 @@ public class BulkApiService {
         }
     }
 
-    private void handleException(ApiMessage message, Throwable ex) {
+    private void handleException(Signal message, Throwable ex) {
         String status;
 
         if (ex instanceof WebClientResponseException wcre) {
