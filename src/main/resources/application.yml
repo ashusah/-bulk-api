@@ -8,15 +8,6 @@ spring:
     password: P@ssw0rd
     driver-class-name: com.microsoft.sqlserver.jdbc.SQLServerDriver
 
-  redis:
-    host: localhost
-    port: 6379
-    lettuce:
-      pool:
-        max-active: 20
-        max-idle: 10
-        min-idle: 2
-
 bulk-api:
   external-api:
     base-url: "http://localhost:8081"
