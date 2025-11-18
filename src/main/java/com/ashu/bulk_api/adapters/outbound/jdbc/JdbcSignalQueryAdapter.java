@@ -3,6 +3,8 @@ package com.ashu.bulk_api.adapters.outbound.jdbc;
 import com.ashu.bulk_api.core.domain.model.Signal;
 import com.ashu.bulk_api.core.port.outbound.SignalQueryPort;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowCallbackHandler;
+
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Component;
 
@@ -31,8 +33,9 @@ public class JdbcSignalQueryAdapter implements SignalQueryPort {
     @Override
     public void streamAllSignals(Consumer<Signal> consumer) {
         AtomicInteger rowNum = new AtomicInteger();
-        jdbcTemplate.query(SIGNAL_SELECT, rs ->
-                consumer.accept(mapper.mapRow(rs, rowNum.getAndIncrement())));
+        RowCallbackHandler callback = rs ->
+                consumer.accept(mapper.mapRow(rs, rowNum.getAndIncrement()));
+        jdbcTemplate.query(SIGNAL_SELECT, callback);
     }
 
     @Override

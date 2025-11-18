@@ -17,7 +17,7 @@ public class JobProgressTracker {
         if (jobId == null || totalBatches <= 0) {
             return JobProgress.disabled();
         }
-        JobProgress progress = new JobProgress(jobId, totalBatches);
+        JobProgress progress = new JobProgress(jobId, totalBatches, true);
         log.info("Job {} started with {} batches", jobId, totalBatches);
         return progress;
     }
