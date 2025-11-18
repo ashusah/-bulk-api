@@ -1,5 +1,6 @@
 package com.ashu.bulk_api.controller;
 
+import com.ashu.bulk_api.dto.AsyncJobResponse;
 import com.ashu.bulk_api.dto.JobResult;
 import com.ashu.bulk_api.model.ApiMessage;
 import com.ashu.bulk_api.orchestrator.BulkApiOrchestrator;
@@ -45,7 +46,7 @@ public class BulkApiController {
     }
 
     @PostMapping("/process-db-async")
-    public ResponseEntity<String> processBulkFromDbAsync() {
+    public ResponseEntity<AsyncJobResponse> processBulkFromDbAsync() {
         String jobId = UUID.randomUUID().toString();
 
         CompletableFuture<JobResult> jobFuture = CompletableFuture
@@ -59,7 +60,7 @@ public class BulkApiController {
                     return null;
                 });
 
-        return ResponseEntity.accepted().body("Job started with ID: " + jobId);
+        return ResponseEntity.accepted().body(AsyncJobResponse.accepted(jobId));
     }
 
     @PostMapping("/process-sync")
