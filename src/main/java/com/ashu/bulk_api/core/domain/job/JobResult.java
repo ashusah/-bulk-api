@@ -1,4 +1,4 @@
-package com.ashu.bulk_api.dto;
+package com.ashu.bulk_api.core.domain.job;
 
 import lombok.AllArgsConstructor;
 import lombok.Data;

@@ -1,64 +1,61 @@
-package com.ashu.bulk_api.orchestrator;
+package com.ashu.bulk_api.core.application;
 
-import com.ashu.bulk_api.dto.BatchResult;
-import com.ashu.bulk_api.dto.JobResult;
-import com.ashu.bulk_api.model.ApiMessage;
-import com.ashu.bulk_api.orchestrator.JobProgressTracker.JobProgress;
-import com.ashu.bulk_api.service.BulkApiService;
+import com.ashu.bulk_api.core.domain.job.BatchResult;
+import com.ashu.bulk_api.core.domain.job.JobResult;
+import com.ashu.bulk_api.core.domain.model.Signal;
+import com.ashu.bulk_api.core.port.inbound.SignalProcessingUseCase;
+import com.ashu.bulk_api.core.port.outbound.SignalBatchPort;
+import com.ashu.bulk_api.core.port.outbound.SignalQueryPort;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
-import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Service;
 
-import java.sql.ResultSet;
-import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
-@Component
+@Service
 @Slf4j
-public class BulkApiOrchestrator {
+public class SignalProcessingService implements SignalProcessingUseCase {
 
-    private final BulkApiService bulkApiService;
-    private final JdbcTemplate jdbcTemplate;
-    private static final String SIGNAL_SELECT = "SELECT uabs_event_id,event_record_date_time, event_type, event_status, " +
-            "unauthorized_debit_balance, book_date, grv, product_id, agreement_id, signal_start_date, signal_end_date FROM signals";
-
+    private final SignalBatchPort signalBatchPort;
+    private final SignalQueryPort signalQueryPort;
     private final ThreadPoolTaskExecutor taskExecutor;
     private final int batchSize;
     private final JobProgressTracker jobProgressTracker;
 
-    public BulkApiOrchestrator(BulkApiService bulkApiService,
-                               JdbcTemplate jdbcTemplate,
-                               @Qualifier("bulkApiTaskExecutor") ThreadPoolTaskExecutor taskExecutor,
-                               @Value("${bulk-api.processing.batch-size:100}") int batchSize,
-                               JobProgressTracker jobProgressTracker) {
-        this.bulkApiService = bulkApiService;
-        this.jdbcTemplate = jdbcTemplate;
+    public SignalProcessingService(SignalBatchPort signalBatchPort,
+                                   SignalQueryPort signalQueryPort,
+                                   @Qualifier("bulkApiTaskExecutor") ThreadPoolTaskExecutor taskExecutor,
+                                   @Value("${bulk-api.processing.batch-size:100}") int batchSize,
+                                   JobProgressTracker jobProgressTracker) {
+        this.signalBatchPort = signalBatchPort;
+        this.signalQueryPort = signalQueryPort;
         this.taskExecutor = taskExecutor;
         this.batchSize = Math.max(1, batchSize);
         this.jobProgressTracker = jobProgressTracker;
     }
 
-    public JobResult processAllMessages(List<ApiMessage> messages) {
-        if (messages == null || messages.isEmpty()) {
-            log.info("No messages received for synchronous processing");
-            return new JobResult(0, 0, "No messages to process");
+    @Override
+    public JobResult processSignals(List<Signal> signals) {
+        if (signals == null || signals.isEmpty()) {
+            log.info("No signals received for synchronous processing");
+            return new JobResult(0, 0, "No signals to process");
         }
 
-        log.info("🚀 Starting bulk processing for {} messages", messages.size());
+        log.info("🚀 Starting bulk processing for {} signals", signals.size());
         logExecutorStats("Before submitting tasks");
 
         List<TrackedBatch> trackedBatches = new ArrayList<>();
         AtomicInteger batchCounter = new AtomicInteger();
-        for (int start = 0; start < messages.size(); start += batchSize) {
-            int end = Math.min(start + batchSize, messages.size());
-            List<ApiMessage> batch = new ArrayList<>(messages.subList(start, end));
+        for (int start = 0; start < signals.size(); start += batchSize) {
+            int end = Math.min(start + batchSize, signals.size());
+            List<Signal> batch = new ArrayList<>(signals.subList(start, end));
             trackedBatches.add(submitBatch(batch, batchCounter.incrementAndGet()));
         }
 
@@ -68,20 +65,22 @@ public class BulkApiOrchestrator {
         return result;
     }
 
-    public JobResult processAllMessagesFromDb() {
-        return processAllMessagesFromDb(null);
+    @Override
+    public JobResult processSignalsFromDatabase() {
+        return processSignalsFromDatabase(null);
     }
 
-    public JobResult processAllMessagesFromDb(String jobId) {
+    @Override
+    public JobResult processSignalsFromDatabase(String jobId) {
         log.info("Querying database for all signals...");
         logExecutorStats("Before submitting tasks");
         List<TrackedBatch> trackedBatches = new ArrayList<>();
-        List<ApiMessage> buffer = new ArrayList<>(batchSize);
+        List<Signal> buffer = new ArrayList<>(batchSize);
         AtomicInteger totalRows = new AtomicInteger();
         AtomicInteger batchCounter = new AtomicInteger();
 
-        jdbcTemplate.query(SIGNAL_SELECT, rs -> {
-            buffer.add(mapRow(rs));
+        signalQueryPort.streamAllSignals(signal -> {
+            buffer.add(signal);
             totalRows.incrementAndGet();
             if (buffer.size() == batchSize) {
                 trackedBatches.add(submitBatch(new ArrayList<>(buffer), batchCounter.incrementAndGet()));
@@ -93,9 +92,9 @@ public class BulkApiOrchestrator {
             trackedBatches.add(submitBatch(new ArrayList<>(buffer), batchCounter.incrementAndGet()));
         }
 
-        log.info("Fetched {} messages from DB", totalRows.get());
+        log.info("Fetched {} signals from DB", totalRows.get());
 
-        JobProgress jobProgress = jobProgressTracker.start(jobId, trackedBatches.size());
+        JobProgressTracker.JobProgress jobProgress = jobProgressTracker.start(jobId, trackedBatches.size());
         attachProgressLogging(jobProgress, trackedBatches);
 
         String message = totalRows.get() == 0 ? "No signals found in DB" : "DB job completed";
@@ -105,22 +104,26 @@ public class BulkApiOrchestrator {
         return result;
     }
 
+    @Override
+    public Optional<Signal> findLatestSignalByAgreementId(long agreementId) {
+        return signalQueryPort.findLatestByAgreementId(agreementId);
+    }
+
     private void logExecutorStats(String stage) {
         log.info("[{}] Active threads: {}, Pool size: {}, Queue size: {}",
                 stage,
                 taskExecutor.getActiveCount(),
                 taskExecutor.getPoolSize(),
-                taskExecutor.getThreadPoolExecutor().getQueue().size()
-        );
+                taskExecutor.getThreadPoolExecutor().getQueue().size());
     }
 
-    private TrackedBatch submitBatch(List<ApiMessage> batch, int batchNumber) {
+    private TrackedBatch submitBatch(List<Signal> batch, int batchNumber) {
         logExecutorStats("Submitting batch #" + batchNumber + " of size " + batch.size());
-        CompletableFuture<BatchResult> future = bulkApiService.processBatch(batch);
+        CompletableFuture<BatchResult> future = signalBatchPort.submitBatch(batch);
         return new TrackedBatch(future, batchNumber, batch.size());
     }
 
-    private void attachProgressLogging(JobProgress jobProgress, List<TrackedBatch> trackedBatches) {
+    private void attachProgressLogging(JobProgressTracker.JobProgress jobProgress, List<TrackedBatch> trackedBatches) {
         if (trackedBatches.isEmpty()) {
             return;
         }
@@ -156,22 +159,5 @@ public class BulkApiOrchestrator {
         return new JobResult(success, failure, message);
     }
 
-    private ApiMessage mapRow(ResultSet rs) throws SQLException {
-        return new ApiMessage(
-                rs.getLong("uabs_event_id"),
-                rs.getString("event_type"),
-                rs.getString("event_status"),
-                rs.getInt("unauthorized_debit_balance"),
-                rs.getTimestamp("event_record_date_time").toLocalDateTime(),
-                rs.getDate("book_date").toLocalDate(),
-                rs.getInt("grv"),
-                rs.getLong("product_id"),
-                rs.getLong("agreement_id"),
-                rs.getDate("signal_start_date").toLocalDate(),
-                rs.getDate("signal_end_date").toLocalDate()
-        );
-    }
-
     private record TrackedBatch(CompletableFuture<BatchResult> future, int number, int size) {}
 }
-
